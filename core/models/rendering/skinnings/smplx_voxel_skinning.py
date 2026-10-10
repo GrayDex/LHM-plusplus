@@ -658,16 +658,37 @@ class SMPLXVoxelSkinning(nn.Module):
         """
 
         B = transform_mat_joint.shape[0]
-        query_weights = self.query_voxel_skinning_weights(query_points.view(1, -1, 3))
-        query_weights = query_weights.view(B, -1, query_weights.shape[-1])
-
-        # Use original weights for fixed parts
-        orig_weights = self.skinning_weight.unsqueeze(0).repeat(B, 1, 1)
-        query_weights[fix_mask] = orig_weights[fix_mask]
+        query_weights = self.skinning_weights(query_points, fix_mask, B)
 
         return torch.matmul(
             query_weights, transform_mat_joint.view(B, self.base_skinning.joint_num, 16)
         ).view(B, -1, 4, 4)
+
+    def skinning_weights(self, query_points, fix_mask, batch_size):
+        """
+        Per-point skinning weights over all joints: the voxel field, and the mesh's own weights
+        where ``fix_mask`` is set (see ``fixed_part_mask``).
+
+        Returns:
+            torch.Tensor: [B, N, num_joints].
+        """
+
+        query_weights = self.query_voxel_skinning_weights(query_points.view(1, -1, 3))
+        query_weights = query_weights.view(batch_size, -1, query_weights.shape[-1])
+
+        # Use original weights for fixed parts
+        orig_weights = self.skinning_weight.unsqueeze(0).repeat(batch_size, 1, 1)
+        query_weights[fix_mask] = orig_weights[fix_mask]
+        return query_weights
+
+    def fixed_part_mask(self, batch_size):
+        """Hands and face keep the mesh's own skinning weights. Returns [B, N] bool."""
+
+        return (
+            ((self.is_rhand + self.is_lhand + self.is_face) > 0)
+            .unsqueeze(0)
+            .repeat(batch_size, 1)
+        )
 
     def transform_to_posed_verts_from_neutral_pose(self, points, smplx_data, device):
         """
@@ -729,12 +750,7 @@ class SMPLXVoxelSkinning(nn.Module):
 
             pdb.set_trace()
 
-        # Create mask for fixed parts (hands and face)
-        mask = (
-            ((self.is_rhand + self.is_lhand + self.is_face) > 0)
-            .unsqueeze(0)
-            .repeat(batch_size, 1)
-        )
+        mask = self.fixed_part_mask(batch_size)
 
         # Transform to null pose
         transform_mat_null = self.get_transform_mat_vertex(transform_mat, mean_3d, mask)

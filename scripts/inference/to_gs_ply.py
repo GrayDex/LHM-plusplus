@@ -162,7 +162,8 @@ def default_export_output_path(args: argparse.Namespace) -> str:
     pose_path = _effective_pose_dir(args)
     if pose_path is None:
         folder = _derive_folder_name_for_tpose_output(args)
-        return os.path.join(_LHM_ROOT, "outputs", "tpose_output", f"{folder}.ply")
+        kind = "skinned_output" if getattr(args, "with_skinning", False) else "tpose_output"
+        return os.path.join(_LHM_ROOT, "outputs", kind, f"{folder}.ply")
     pose_path = str(Path(pose_path).expanduser())
     motion_key = _derive_pose_seq_folder_name(pose_path)
     img_key = _derive_input_image_folder_name(args)
@@ -252,6 +253,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "Path to one SMPL-X parameter JSON (e.g. motion_video/BasketBall_I/smplx_params/00014.json). "
             "Optional matching FLAME file: ../flame_params/<same_name>.json. "
             "Default empty => canonical T-pose export with a synthetic camera (no motion file)."
+        ),
+    )
+    parser.add_argument(
+        "--with_skinning",
+        action="store_true",
+        help=(
+            "Export Gaussians in the SMPL-X zero pose with per-Gaussian joints/weights "
+            "(vertex properties joint_i, weight_i) and the skeleton (element 'joint': parent, x, y, z), "
+            "so any engine can pose them by plain LBS. Not combinable with --pose_dir."
+        ),
+    )
+    parser.add_argument(
+        "--skinning_top_k",
+        type=int,
+        default=8,
+        help=(
+            "Joints kept per Gaussian in --with_skinning export; weights are renormalized. "
+            "8 keeps the position within 4 mm of LHM++ posing (scripts/inference/check_skinned_ply.py)."
         ),
     )
     parser.add_argument(
@@ -548,6 +567,82 @@ def build_tpose_smplx_params(
     return sp
 
 
+def build_zero_pose_smplx_params(
+    motion_seq_one: dict[str, Any],
+    transform_mat_neutral_pose: torch.Tensor,
+    merged_betas: torch.Tensor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """SMPL-X zero pose (arms out, legs straight): the bind pose of the skinned export."""
+    sp = build_tpose_smplx_params(
+        motion_seq_one, transform_mat_neutral_pose, merged_betas, device, dtype
+    )
+    sp["body_pose"] = torch.zeros_like(sp["body_pose"])
+    return sp
+
+
+@torch.no_grad()
+def build_skinned_export(
+    renderer,
+    gs_attr,
+    query_points: dict[str, Any],
+    smplx_zero: dict[str, torch.Tensor],
+    top_k: int,
+):
+    """Gaussians in the SMPL-X zero pose, top-k joints and weights per Gaussian, and the skeleton.
+
+    LHM++ poses a Gaussian neutral -> zero pose -> frame, both stages blending the joints with the
+    same per-point weights; the first stage and the shape blendshapes do not depend on the frame.
+    Posing through LHM++'s own path with a zero frame bakes them, and what is left for a frame is
+    plain LBS about the zero pose. Expression offsets are not exported.
+    """
+    neutral = query_points["neutral_coords"][0]
+    smplx_view = renderer.get_single_view_smpl_data(smplx_zero, 0)
+    smplx_one = renderer._get_single_batch_data(smplx_view, 0)
+    zero_models, _ = renderer.animate_gs_model(
+        gs_attr, neutral, smplx_one, debug=False, mesh_meta=query_points["mesh_meta"]
+    )
+
+    skin = renderer.smplx_model
+    mean_3d = (neutral + gs_attr.offset_xyz).unsqueeze(0)
+    weights = skin.skinning_weights(mean_3d, skin.fixed_part_mask(1), 1)[0]
+    top_w, top_j = torch.topk(weights, top_k, dim=-1)
+    top_w = top_w / top_w.sum(-1, keepdim=True).clamp_min(1e-8)
+
+    # face_offset / joint_offset are absent on LHM++'s own animation path as well
+    betas = smplx_one["betas"].reshape(1, -1)
+    joints = skin.get_zero_pose_human(
+        shape_param=betas, device=betas.device, face_offset=None, joint_offset=None
+    )[0]
+    parents = skin.smplx_layer.parents
+    return zero_models[0], top_j, top_w, joints, parents
+
+
+def save_skinned_ply(gs_zero, top_j, top_w, joints, parents, path: str) -> None:
+    """Standard 3DGS vertex properties + ``joint_i``/``weight_i``, then element ``joint``."""
+    from plyfile import PlyElement
+
+    k = top_j.shape[1]
+    j = top_j.cpu().numpy().astype(np.uint8)
+    w = top_w.float().cpu().numpy()
+    extra = [(f"joint_{i}", "u1", j[:, i]) for i in range(k)]
+    extra += [(f"weight_{i}", "f4", w[:, i]) for i in range(k)]
+
+    jt = joints.float().cpu().numpy()
+    skeleton = np.empty(
+        jt.shape[0], dtype=[("parent", "i4"), ("x", "f4"), ("y", "f4"), ("z", "f4")]
+    )
+    skeleton["parent"] = parents.cpu().numpy().astype(np.int32)
+    skeleton["x"], skeleton["y"], skeleton["z"] = jt[:, 0], jt[:, 1], jt[:, 2]
+
+    gs_zero.save_ply(
+        path,
+        extra_vertex_fields=extra,
+        extra_elements=[PlyElement.describe(skeleton, "joint")],
+    )
+
+
 def build_animation_frame_smplx_params(
     motion_seq_one: dict[str, Any],
     transform_mat_neutral_pose: torch.Tensor,
@@ -568,23 +663,13 @@ def build_animation_frame_smplx_params(
 
 
 @torch.no_grad()
-def run_tpose_export(
+def infer_gaussians(
     model: torch.nn.Module,
     ref_imgs_tensor: torch.Tensor,
     motion_seq: dict[str, Any],
     device: str,
-    output_ply: str,
-    *,
-    export_animation_pose: bool = False,
-) -> None:
-    """``infer_single_view`` → ``inference_gs`` → ``GaussianModel.save_ply``.
-
-    SMPL-X for the forward pass is taken from the first frame of ``motion_seq`` (see
-    ``slice_motion_seq_to_single_frame``), so it matches cameras and body pose length.
-
-    If ``export_animation_pose`` is True (non-empty ``--pose_dir``), the final GS matches that
-    JSON pose. Otherwise it uses canonical T-pose in SMPL-X angles.
-    """
+) -> SimpleNamespace:
+    """``infer_single_view`` on the first frame of ``motion_seq``; shape betas merged."""
     dev = torch.device(device)
     use_pred_render = getattr(model, "use_pred_shape_for_render", False)
     motion_one = slice_motion_seq_to_single_frame(motion_seq, frame_idx=0)
@@ -637,9 +722,62 @@ def run_tpose_export(
         raise RuntimeError(f"Unexpected infer_single_view outputs: {len(model_outputs)}")
 
     merged = type(model).smplx_params_with_pred_shape_betas(smplx_dev, pred_shape)
-    merged_betas = merged["betas"]
+    return SimpleNamespace(
+        dev=dev,
+        motion_one=motion_one,
+        gs_model_list=gs_model_list,
+        query_points=query_points,
+        transform_mat_neutral_pose=transform_mat_neutral_pose,
+        gs_hidden_features=gs_hidden_features,
+        merged_betas=merged["betas"],
+        render_c2ws=render_c2ws,
+        render_intrs=render_intrs,
+        render_bg_colors=render_bg_colors,
+    )
+
+
+@torch.no_grad()
+def run_tpose_export(
+    model: torch.nn.Module,
+    ref_imgs_tensor: torch.Tensor,
+    motion_seq: dict[str, Any],
+    device: str,
+    output_ply: str,
+    *,
+    export_animation_pose: bool = False,
+    with_skinning: bool = False,
+    skinning_top_k: int = 8,
+) -> None:
+    """``infer_single_view`` → ``inference_gs`` → ``GaussianModel.save_ply``.
+
+    SMPL-X for the forward pass is taken from the first frame of ``motion_seq`` (see
+    ``slice_motion_seq_to_single_frame``), so it matches cameras and body pose length.
+
+    If ``export_animation_pose`` is True (non-empty ``--pose_dir``), the final GS matches that
+    JSON pose. Otherwise it uses canonical T-pose in SMPL-X angles.
+    """
+    inf = infer_gaussians(model, ref_imgs_tensor, motion_seq, device)
+    dev, motion_one = inf.dev, inf.motion_one
+    gs_model_list, query_points = inf.gs_model_list, inf.query_points
+    transform_mat_neutral_pose = inf.transform_mat_neutral_pose
+    gs_hidden_features, merged_betas = inf.gs_hidden_features, inf.merged_betas
+    render_c2ws, render_intrs = inf.render_c2ws, inf.render_intrs
+    render_bg_colors = inf.render_bg_colors
 
     dtype = merged_betas.dtype
+    if with_skinning:
+        smplx_zero = build_zero_pose_smplx_params(
+            motion_one, transform_mat_neutral_pose, merged_betas, dev, dtype
+        )
+        export = build_skinned_export(
+            model.renderer, gs_model_list[0], query_points, smplx_zero, skinning_top_k
+        )
+        out_abs = os.path.abspath(output_ply)
+        os.makedirs(os.path.dirname(out_abs), exist_ok=True)
+        save_skinned_ply(*export, out_abs)
+        print(f"Saved skinned zero-pose Gaussian PLY to {out_abs}")
+        return
+
     if export_animation_pose:
         gs_smplx = build_animation_frame_smplx_params(
             motion_one,
@@ -790,6 +928,8 @@ def setup_loaders_and_inputs(args: argparse.Namespace):
 def main() -> None:
     parser = build_arg_parser()
     args = parser.parse_args()
+    if args.with_skinning and _effective_pose_dir(args) is not None:
+        parser.error("--with_skinning exports the bind pose; drop --pose_dir")
     if args.output is None:
         args.output = default_export_output_path(args)
 
@@ -819,6 +959,8 @@ def main() -> None:
         device=device,
         output_ply=os.path.abspath(args.output),
         export_animation_pose=_effective_pose_dir(args) is not None,
+        with_skinning=args.with_skinning,
+        skinning_top_k=args.skinning_top_k,
     )
 
 

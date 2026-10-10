@@ -91,12 +91,15 @@ class GaussianModel:
             l.append("rot_{}".format(i))
         return l
 
-    def save_ply(self, path):
+    def save_ply(self, path, extra_vertex_fields=(), extra_elements=()):
         """
         Save the 3D Gaussian data and attributes to a PLY file.
 
         Args:
             path (str): The file path where the PLY file will be saved.
+            extra_vertex_fields: ``(name, numpy dtype, array[N])`` appended after the standard
+                vertex properties, e.g. skinning joints and weights.
+            extra_elements: ``PlyElement`` written after ``vertex``, e.g. a skeleton.
 
         This method exports the 3D positions, normals, appearance features (either SH or RGB),
         opacity, scaling, and rotation attributes of all Gaussians in the model into a structured
@@ -139,14 +142,19 @@ class GaussianModel:
         dtype_full = [
             (attribute, "f4") for attribute in self.construct_list_of_attributes()
         ]
+        dtype_full += [(name, dtype) for name, dtype, _ in extra_vertex_fields]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
         attributes = np.concatenate(
             (xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1
         )
-        elements[:] = list(map(tuple, attributes))
+        standard = [name for name, _ in dtype_full[: attributes.shape[1]]]
+        for i, name in enumerate(standard):
+            elements[name] = attributes[:, i]
+        for name, _, values in extra_vertex_fields:
+            elements[name] = values
         el = PlyElement.describe(elements, "vertex")
-        PlyData([el]).write(path)
+        PlyData([el, *extra_elements]).write(path)
 
     def load_ply(self, path):
         """
